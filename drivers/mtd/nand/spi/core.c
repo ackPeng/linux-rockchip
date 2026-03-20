@@ -567,11 +567,39 @@ static int spinand_lock_block(struct spinand_device *spinand, u8 lock)
 	return spinand_write_reg_op(spinand, REG_BLOCK_LOCK, lock);
 }
 
+static int spinand_read_page_wait(struct spinand_device *spinand, u8 *s)
+{
+	unsigned long timeo =  jiffies + msecs_to_jiffies(400);
+	u8 status;
+	int ret;
+
+	do {
+		ret = spinand_read_status(spinand, &status);
+		if (ret)
+			return ret;
+
+		if (status & STATUS_BUSY)
+			continue;
+
+		ret = spinand_read_status(spinand, &status);
+		if (ret)
+			return ret;
+
+		if (!(status & STATUS_BUSY))
+			break;
+
+	} while (time_before(jiffies, timeo));
+
+	*s = status;
+
+	return status & STATUS_BUSY ? -ETIMEDOUT : 0;
+}
+
 static int spinand_read_page(struct spinand_device *spinand,
 			     const struct nand_page_io_req *req)
 {
 	struct nand_device *nand = spinand_to_nand(spinand);
-	u8 status = 0;
+	u8 status;
 	int ret;
 
 	ret = nand_ecc_prepare_io_req(nand, (struct nand_page_io_req *)req);
@@ -582,22 +610,19 @@ static int spinand_read_page(struct spinand_device *spinand,
 	if (ret)
 		return ret;
 
-	ret = spinand_wait(spinand,
-			   SPINAND_READ_INITIAL_DELAY_US,
-			   SPINAND_READ_POLL_DELAY_US,
-			   &status);
-	/*
-	 * When there is data outside of OIP in the status, the status data is
-	 * inaccurate and needs to be reconfirmed
-	 */
-	if (spinand->id.data[0] == 0x01 && status && !ret) {
+	/* Workaround for Skyhigh */
+	if (spinand->id.data[0] == 0x01) {
+		ret = spinand_read_page_wait(spinand, &status);
+		if (ret)
+			return ret;
+	} else {
 		ret = spinand_wait(spinand,
 				   SPINAND_READ_INITIAL_DELAY_US,
 				   SPINAND_READ_POLL_DELAY_US,
 				   &status);
+		if (ret < 0)
+			return ret;
 	}
-	if (ret < 0)
-		return ret;
 
 	spinand_ondie_ecc_save_status(nand, status);
 
@@ -635,7 +660,10 @@ static int spinand_write_page(struct spinand_device *spinand,
 			   SPINAND_WRITE_INITIAL_DELAY_US,
 			   SPINAND_WRITE_POLL_DELAY_US,
 			   &status);
-	if (!ret && (status & STATUS_PROG_FAILED))
+	if (ret)
+		return ret;
+
+	if (status & STATUS_PROG_FAILED)
 		return -EIO;
 
 	return nand_ecc_finish_io_req(nand, (struct nand_page_io_req *)req);
@@ -961,7 +989,8 @@ static const struct spinand_manufacturer *spinand_manufacturers[] = {
 	&dosilicon_spinand_manufacturer,
 #endif
 #ifdef CONFIG_MTD_SPI_NAND_ESMT
-	&esmt_spinand_manufacturer,
+	&esmt_8c_spinand_manufacturer,
+	&esmt_c8_spinand_manufacturer,
 #endif
 #ifdef CONFIG_MTD_SPI_NAND_ETRON
 	&etron_spinand_manufacturer,
@@ -984,8 +1013,14 @@ static const struct spinand_manufacturer *spinand_manufacturers[] = {
 #ifdef CONFIG_MTD_SPI_NAND_HYF
 	&hyf_spinand_manufacturer,
 #endif
+#ifdef CONFIG_MTD_SPI_NAND_ISSI
+	&issi_spinand_manufacturer,
+#endif
 #ifdef CONFIG_MTD_SPI_NAND_JSC
 	&jsc_spinand_manufacturer,
+#endif
+#ifdef CONFIG_MTD_SPI_NAND_KINGSTON
+	&kingston_spinand_manufacturer,
 #endif
 #ifdef CONFIG_MTD_SPI_NAND_MACRONIX
 	&macronix_spinand_manufacturer,
@@ -1002,6 +1037,9 @@ static const struct spinand_manufacturer *spinand_manufacturers[] = {
 #ifdef CONFIG_MTD_SPI_NAND_SKYHIGH
 	&skyhigh_spinand_manufacturer,
 #endif
+#ifdef CONFIG_MTD_SPI_NAND_TITAN
+	&titan_spinand_manufacturer,
+#endif
 #ifdef CONFIG_MTD_SPI_NAND_TOSHIBA
 	&toshiba_spinand_manufacturer,
 #endif
@@ -1014,6 +1052,7 @@ static const struct spinand_manufacturer *spinand_manufacturers[] = {
 #endif
 #ifdef CONFIG_MTD_SPI_NAND_XINCUN
 	&xincun_spinand_manufacturer,
+	&xincun_6c_spinand_manufacturer,
 #endif
 #ifdef CONFIG_MTD_SPI_NAND_XTX
 	&xtx_spinand_manufacturer,
@@ -1432,6 +1471,7 @@ static void spinand_cleanup(struct spinand_device *spinand)
 {
 	struct nand_device *nand = spinand_to_nand(spinand);
 
+	nanddev_ecc_engine_cleanup(nand);
 	nanddev_cleanup(nand);
 	spinand_manufacturer_cleanup(spinand);
 	kfree(spinand->databuf);
